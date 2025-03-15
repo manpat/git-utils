@@ -167,7 +167,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-interactive"
+name = "git-utils"
 version = "0.1.0"
 dependencies = [
  "anyhow",

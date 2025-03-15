@@ -19,6 +19,22 @@ struct MainArgs {
 
 #[derive(clap::Subcommand, Debug)]
 enum ArgCommand {
+	/// Install git aliases
+	Install {
+		/// Install aliases for this user.
+		/// This is the default.
+		#[arg(long, short, group = "scope")]
+		user: bool,
+
+		/// Install aliases for the whole system - will be available to all users.
+		#[arg(long, short, group = "scope")]
+		system: bool,
+
+		/// Install aliases only in this repo.
+		#[arg(long, short, group = "scope")]
+		local: bool,
+	},
+
 	/// Interactively switch branches
 	Switch,
 }
@@ -37,6 +53,32 @@ fn main() -> anyhow::Result<()> {
 	}?;
 
 	match args.subcommand {
+		ArgCommand::Install { system, local, .. } => {
+			let current_path = std::env::current_exe()?;
+
+			let mut args = ["config", "set"].to_vec();
+
+			if system {
+				args.push("--system");
+			} else if local {
+				args.push("--local");
+			} else {
+				args.push("--global");
+			}
+
+			let aliases = [
+				("iswitch", "switch"),
+			];
+
+			for (alias, command) in aliases {
+				let config_name = format!("alias.{alias}");
+				let config_command = format!("!{} {command}", current_path.display());
+				git(args.iter().cloned().chain([config_name.as_str(), config_command.as_str()]))?;
+
+				println!("Aliasing `git {alias}` to `git-utils {command}`");
+			}
+		}
+
 		ArgCommand::Switch => {
 			let branch_list = git_list(["for-each-ref", "--format", "%(refname:short)", "refs/heads"])?;
 			let index = list_prompt(&branch_list)?;

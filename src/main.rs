@@ -203,7 +203,7 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 			Event::Key(KeyEvent{ code, modifiers, kind: KeyEventKind::Press, .. }) => match (code, modifiers) {
 				(KeyCode::Enter, _) if !filtered_items.is_empty() => break,
 
-				(KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+				(KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
 					anyhow::bail!("Cancelled")
 				}
 

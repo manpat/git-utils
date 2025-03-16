@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use clap::Parser;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -40,7 +40,19 @@ enum ArgCommand {
 }
 
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
+	match run() {
+		Err(err) => {
+			eprintln!("{err}");
+			ExitCode::FAILURE
+		}
+
+		Ok(()) => ExitCode::SUCCESS
+	}
+}
+
+
+fn run() -> anyhow::Result<()> {
 	let args = MainArgs::parse();
 
 	if !stdout().is_tty() {
@@ -51,6 +63,14 @@ fn main() -> anyhow::Result<()> {
 		stdout(),
 		event::PushKeyboardEnhancementFlags(event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
 	}?;
+
+	let _guard = on_drop(|| {
+		execute!{
+			stdout(),
+			event::PopKeyboardEnhancementFlags,
+			style::ResetColor,
+		}.unwrap();
+	});
 
 	match args.subcommand {
 		ArgCommand::Install { system, local, .. } => {
@@ -88,12 +108,6 @@ fn main() -> anyhow::Result<()> {
 		}
 	}
 
-	execute!{
-		stdout(),
-		event::PopKeyboardEnhancementFlags,
-		style::ResetColor,
-	}?;
-
 	Ok(())
 }
 
@@ -119,8 +133,17 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 	}
 
 	let start_row = cursor::position()?.1;
-	let matcher = SkimMatcherV2::default();
 
+	let _guard = on_drop(|| {
+		execute!{
+			stdout(),
+			cursor::MoveTo(0, start_row),
+			terminal::Clear(terminal::ClearType::FromCursorDown),
+			style::ResetColor,
+		}.unwrap();
+	});
+
+	let matcher = SkimMatcherV2::default();
 	let item_strings: Vec<_> = items.iter().map(|item| item.to_string()).collect();
 
 	#[derive(Ord, PartialOrd, Eq, PartialEq)]
@@ -181,13 +204,6 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 				(KeyCode::Enter, _) if !filtered_items.is_empty() => break,
 
 				(KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-					execute!{
-						out,
-						cursor::MoveTo(0, start_row),
-						terminal::Clear(terminal::ClearType::FromCursorDown),
-						style::ResetColor,
-					}?;
-
 					anyhow::bail!("Cancelled")
 				}
 
@@ -260,13 +276,6 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 		}
 	}
 
-	execute!{
-		out,
-		cursor::MoveTo(0, start_row),
-		terminal::Clear(terminal::ClearType::FromCursorDown),
-		style::ResetColor,
-	}?;
-
 	anyhow::ensure!(selected_index < filtered_items.len());
 
 	Ok(filtered_items[selected_index].original_index)
@@ -301,16 +310,24 @@ fn git_list<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<Vec<String>>
 
 
 fn start_raw_mode() -> anyhow::Result<impl Drop> {
-	#[must_use]
-	struct Guard;
+	terminal::enable_raw_mode()?;
+	Ok(on_drop(|| {
+		terminal::disable_raw_mode().unwrap()
+	}))
+}
 
-	impl Drop for Guard {
+
+fn on_drop(f: impl FnOnce()) -> impl Drop {
+	use std::mem::ManuallyDrop;
+
+	#[must_use]
+	struct DropGuard<F: FnOnce()>(ManuallyDrop<F>);
+	impl<F: FnOnce()> Drop for DropGuard<F> {
 		fn drop(&mut self) {
-			terminal::disable_raw_mode().unwrap();
+			let f = unsafe{ ManuallyDrop::take(&mut self.0) };
+			f();
 		}
 	}
 
-	terminal::enable_raw_mode()?;
-	Ok(Guard)
+	DropGuard(ManuallyDrop::new(f))
 }
-

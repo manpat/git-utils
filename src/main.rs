@@ -96,7 +96,7 @@ fn run() -> anyhow::Result<()> {
 			let current_path = std::env::current_exe()?;
 
 			let current_path_fixed = if cfg!(windows) {
-				use std::ffi::{OsString, OsStr};
+				use std::ffi::{OsString};
 				use std::path::{PathBuf, Component};
 
 				let mut current_path_string = OsString::with_capacity(current_path.as_os_str().len());
@@ -201,8 +201,8 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 	let mut offset = 0;
 	let mut filter_string = String::new();
 
-	let (_, height) = terminal::size()?;
-	let desired_height = height.min(items.len() as u16 + 1);
+	let (_, terminal_height) = terminal::size()?;
+	let desired_height = terminal_height.min(items.len() as u16 + 1);
 	let max_visible_items = desired_height as usize - 1;
 
 	// Clear enough space
@@ -244,6 +244,11 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 	loop {
 		execute!{
 			out,
+			terminal::BeginSynchronizedUpdate,
+		}?;
+
+		execute!{
+			out,
 			cursor::MoveTo(0, start_row),
 			terminal::Clear(terminal::ClearType::FromCursorDown),
 			style::Print("Switch to branch: "),
@@ -275,6 +280,7 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 		execute!{
 			out,
 			cursor::MoveTo(cursor_start + cursor_index as u16, start_row),
+			terminal::EndSynchronizedUpdate,
 		}?;
 
 		let _guard = start_raw_mode()?;
@@ -311,8 +317,12 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 
 				(KeyCode::Up, _) => { selected_index = selected_index.saturating_sub(1); }
 				(KeyCode::Down, _) => { selected_index += 1; }
-				(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(5); }
-				(KeyCode::PageDown, _) => { selected_index += 5; }
+
+				(KeyCode::PageUp, KeyModifiers::CONTROL) => { selected_index = 0; }
+				(KeyCode::PageDown, KeyModifiers::CONTROL) => { selected_index = filtered_items.len(); }
+
+				(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(terminal_height as usize - 1); }
+				(KeyCode::PageDown, _) => { selected_index += terminal_height as usize - 1; }
 
 				(KeyCode::Char(ch), _) => if ch.is_ascii() {
 					filter_string.insert(cursor_index, ch);

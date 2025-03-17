@@ -95,6 +95,30 @@ fn run() -> anyhow::Result<()> {
 		ArgCommand::Install { system, local, .. } => {
 			let current_path = std::env::current_exe()?;
 
+			let current_path_fixed = if cfg!(windows) {
+				use std::ffi::{OsString, OsStr};
+				use std::path::{PathBuf, Component};
+
+				let mut current_path_string = OsString::with_capacity(current_path.as_os_str().len());
+				for component in current_path.components() {
+					match component {
+						Component::Prefix(prefix) => current_path_string.push(prefix.as_os_str()),
+						Component::RootDir => {},
+						other => {
+							// Git seems to require unix paths
+							current_path_string.push("/");
+							current_path_string.push(other);
+						}
+					}
+				}
+
+				PathBuf::from(current_path_string)
+
+			} else {
+				current_path.to_path_buf()
+			};
+
+
 			let mut args = ["config", "set"].to_vec();
 
 			if system {
@@ -111,7 +135,7 @@ fn run() -> anyhow::Result<()> {
 
 			for (alias, command) in aliases {
 				let config_name = format!("alias.{alias}");
-				let config_command = format!("!{} {command}", current_path.display());
+				let config_command = format!("!{} {command}", current_path_fixed.display());
 				git(args.iter().cloned().chain([config_name.as_str(), config_command.as_str()]))?;
 
 				println!("Aliasing `git {alias}` to `git-utils {command}`");

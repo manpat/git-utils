@@ -84,15 +84,9 @@ fn run() -> anyhow::Result<()> {
 		simplelog::WriteLogger::init(log::LevelFilter::Info, simplelog::Config::default(), log_file)?;
 	}
 
-	execute!{
-		stdout(),
-		event::PushKeyboardEnhancementFlags(event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-	}?;
-
 	let _guard = on_drop(|| {
 		execute!{
 			stdout(),
-			event::PopKeyboardEnhancementFlags,
 			style::ResetColor,
 		}.unwrap();
 	});

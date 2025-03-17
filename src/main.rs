@@ -130,6 +130,7 @@ fn run() -> anyhow::Result<()> {
 				true => "refs/remotes"
 			};
 
+			// TODO(pat.m): include upstream in list
 			let mut branch_list = git_list(["for-each-ref", "--format", "%(refname:lstrip=2)", refspec])?;
 			branch_list.retain(|branch| !branch.ends_with("/HEAD"));
 			if branch_list.is_empty() {

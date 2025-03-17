@@ -1,4 +1,5 @@
 use std::process::{Command, ExitCode};
+use anyhow::Context;
 use clap::Parser;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -13,6 +14,10 @@ use crossterm::{
 #[derive(Parser, Debug)]
 #[command(version, author, about)]
 struct MainArgs {
+	/// Log git commands to file.
+	#[arg(long, global=true)]
+	log: bool,
+
 	#[command(subcommand)]
 	subcommand: ArgCommand,
 }
@@ -36,7 +41,21 @@ enum ArgCommand {
 	},
 
 	/// Interactively switch branches
-	Switch,
+	Switch {
+		/// Create/switch to a remote tracking branch
+		#[arg(long, short)]
+		remote: bool,
+	},
+
+	// SearchCommits
+	// DeleteBranches
+
+	// /// 
+	// CreateBranch {
+	// 	/// Create branch from a commit instead of a branch
+	// 	#[arg(long, short)]
+	// 	commit: bool,
+	// },
 }
 
 
@@ -57,6 +76,12 @@ fn run() -> anyhow::Result<()> {
 
 	if !stdout().is_tty() {
 		anyhow::bail!("Can only be run in an interactive tty");
+	}
+
+	if args.log {
+		use std::fs::File;
+		let log_file = File::create("git-utils.log")?;
+		simplelog::WriteLogger::init(log::LevelFilter::Info, simplelog::Config::default(), log_file)?;
 	}
 
 	execute!{
@@ -99,12 +124,48 @@ fn run() -> anyhow::Result<()> {
 			}
 		}
 
-		ArgCommand::Switch => {
-			let branch_list = git_list(["for-each-ref", "--format", "%(refname:short)", "refs/heads"])?;
-			let index = list_prompt(&branch_list)?;
-			git(["switch", &branch_list[index]])?;
+		ArgCommand::Switch { remote } => {
+			let refspec = match remote {
+				false => "refs/heads",
+				true => "refs/remotes"
+			};
 
-			println!("Switched to branch {}", branch_list[index]);
+			let mut branch_list = git_list(["for-each-ref", "--format", "%(refname:lstrip=2)", refspec])?;
+			branch_list.retain(|branch| !branch.ends_with("/HEAD"));
+			if branch_list.is_empty() {
+				anyhow::bail!("No branches to switch to.");
+			}
+
+			let index = list_prompt(&branch_list)?;
+			let selected_branch = branch_list[index].as_str();
+
+			if remote {
+				let (_remote, local_branch) = selected_branch.split_once('/').context("git for-each-ref yielded info in unexpected format")?;
+
+				if ref_exists(&format!("refs/heads/{local_branch}"))? {
+					match get_upstream(local_branch)? {
+						Some(current_upstream) => {
+							if current_upstream != selected_branch {
+								anyhow::bail!("Branch with name '{local_branch}' already exists but has different tracking branch '{current_upstream}' (expected '{selected_branch}')")
+							}
+						}
+
+						None => {
+							anyhow::bail!("Branch with name '{local_branch}' already exists but isn't tracking requested branch '{selected_branch}'");
+						}
+					}
+
+					git(["switch", local_branch])?;
+					println!("Switched to branch {local_branch}, tracking {selected_branch}");
+				} else {
+					git(["switch", "--track", selected_branch, "--create", local_branch])?;
+					println!("Switched to new branch {local_branch}, tracking {selected_branch}");
+				}
+
+			} else {
+				git(["switch", selected_branch])?;
+				println!("Switched to branch {selected_branch}");
+			}
 		}
 	}
 
@@ -281,26 +342,77 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 	Ok(filtered_items[selected_index].original_index)
 }
 
+struct GitOutput {
+	code: i32,
+	stdout: String,
+	stderr: String,
+}
 
-fn git<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<String>
+fn git<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<GitOutput>
 	where S: AsRef<std::ffi::OsStr>
 {
-	let cmd_output = Command::new("git")
+	let args: Vec<_> = args.into_iter().collect();
+	let arg_strings: Vec<_> = args.iter().map(AsRef::as_ref).collect();
+
+	log::info!("> git {arg_strings:?}");
+
+	let output = Command::new("git")
 		.args(args)
 		.output()?;
 
-	if !cmd_output.status.success() {
-		let stderr = std::str::from_utf8(&cmd_output.stderr)?;
+	let stdout = std::str::from_utf8(&output.stdout)?.trim().to_owned();
+	let stderr = std::str::from_utf8(&output.stderr)?.trim().to_owned();
+
+	Ok(GitOutput {
+		code: output.status.code().unwrap_or(i32::MAX),
+		stdout,
+		stderr,
+	})
+}
+
+fn git_stdout<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<String>
+	where S: AsRef<std::ffi::OsStr>
+{
+	let GitOutput{code, stdout, stderr} = git(args)?;
+
+	log::info!(" -> status: {code}");
+
+	if code != 0 {
+		log::error!("{stderr}");
 		anyhow::bail!("{stderr}");
 	}
 
-	Ok(String::from_utf8(cmd_output.stdout)?)
+	Ok(stdout)
+}
+
+fn ref_exists(refname: &str) -> anyhow::Result<bool> {
+	let GitOutput{code, stderr, ..} = git(["show-ref", "--quiet", refname])?;
+
+	match code {
+		0 => return Ok(true),
+		1 => return Ok(false),
+		_ => {}
+	}
+
+	anyhow::bail!("{stderr}");
+}
+
+fn get_upstream(branch: &str) -> anyhow::Result<Option<String>> {
+	let GitOutput{code, stdout, stderr} = git(["rev-parse", "--quiet", "--abbrev-ref", "--verify", &format!("{branch}@{{upstream}}")])?;
+
+	match code {
+		0 => return Ok(Some(stdout)),
+		1 => return Ok(None),
+		_ => {}
+	}
+
+	anyhow::bail!("{stderr}");
 }
 
 fn git_list<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<Vec<String>>
 	where S: AsRef<std::ffi::OsStr>
 {
-	git(args)?
+	git_stdout(args)?
 		.lines()
 		.map(String::from)
 		.map(Ok)

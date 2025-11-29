@@ -136,13 +136,17 @@ fn run() -> anyhow::Result<()> {
 			for (alias, command) in aliases {
 				let config_name = format!("alias.{alias}");
 				let config_command = format!("!{} {command}", current_path_fixed.display());
-				git(args.iter().cloned().chain([config_name.as_str(), config_command.as_str()]))?;
+				git_run(args.iter().cloned().chain([config_name.as_str(), config_command.as_str()]))?;
 
 				println!("Aliasing `git {alias}` to `git-utils {command}`");
 			}
 		}
 
 		ArgCommand::Switch { remote } => {
+			if !detect_clean_worktree_and_index()? {
+				anyhow::bail!("There are changes in the index/worktree which must be committed, reverted, or stashed before switching branches");
+			}
+
 			let refspec = match remote {
 				false => "refs/heads",
 				true => "refs/remotes"
@@ -174,21 +178,26 @@ fn run() -> anyhow::Result<()> {
 						}
 					}
 
-					git(["switch", local_branch])?;
+					git_run(["switch", local_branch])?;
 					println!("Switched to branch {local_branch}, tracking {selected_branch}");
 				} else {
-					git(["switch", "--track", selected_branch, "--create", local_branch])?;
+					git_run(["switch", "--track", selected_branch, "--create", local_branch])?;
 					println!("Switched to new branch {local_branch}, tracking {selected_branch}");
 				}
 
 			} else {
-				git(["switch", selected_branch])?;
+				git_run(["switch", selected_branch])?;
 				println!("Switched to branch {selected_branch}");
 			}
 		}
 	}
 
 	Ok(())
+}
+
+fn detect_clean_worktree_and_index() -> anyhow::Result<bool> {
+	let modifications = git_list(["status", "--porcelain=1", "--untracked-files=no", "--ignored=no"])?;
+	Ok(modifications.is_empty())
 }
 
 fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
@@ -377,7 +386,7 @@ struct GitOutput {
 	stderr: String,
 }
 
-fn git<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<GitOutput>
+fn git_raw<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<GitOutput>
 	where S: AsRef<std::ffi::OsStr>
 {
 	let args: Vec<_> = args.into_iter().collect();
@@ -389,22 +398,36 @@ fn git<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<GitOutput>
 		.args(args)
 		.output()?;
 
+	let code = output.status.code().unwrap_or(i32::MAX);
+	log::info!(" -> status: {code}");
+
 	let stdout = std::str::from_utf8(&output.stdout)?.trim().to_owned();
 	let stderr = std::str::from_utf8(&output.stderr)?.trim().to_owned();
 
 	Ok(GitOutput {
-		code: output.status.code().unwrap_or(i32::MAX),
+		code,
 		stdout,
 		stderr,
 	})
 }
 
+fn git_run<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<()>
+	where S: AsRef<std::ffi::OsStr>
+{
+	let GitOutput{code, stderr, ..} = git_raw(args)?;
+
+	if code != 0 {
+		log::error!("{stderr}");
+		anyhow::bail!("{stderr}");
+	}
+
+	Ok(())
+}
+
 fn git_stdout<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<String>
 	where S: AsRef<std::ffi::OsStr>
 {
-	let GitOutput{code, stdout, stderr} = git(args)?;
-
-	log::info!(" -> status: {code}");
+	let GitOutput{code, stdout, stderr} = git_raw(args)?;
 
 	if code != 0 {
 		log::error!("{stderr}");
@@ -415,7 +438,7 @@ fn git_stdout<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<String>
 }
 
 fn ref_exists(refname: &str) -> anyhow::Result<bool> {
-	let GitOutput{code, stderr, ..} = git(["show-ref", "--quiet", refname])?;
+	let GitOutput{code, stderr, ..} = git_raw(["show-ref", "--quiet", refname])?;
 
 	match code {
 		0 => return Ok(true),
@@ -427,7 +450,7 @@ fn ref_exists(refname: &str) -> anyhow::Result<bool> {
 }
 
 fn get_upstream(branch: &str) -> anyhow::Result<Option<String>> {
-	let GitOutput{code, stdout, stderr} = git(["rev-parse", "--quiet", "--abbrev-ref", "--verify", &format!("{branch}@{{upstream}}")])?;
+	let GitOutput{code, stdout, stderr} = git_raw(["rev-parse", "--quiet", "--abbrev-ref", "--verify", &format!("{branch}@{{upstream}}")])?;
 
 	match code {
 		0 => return Ok(Some(stdout)),

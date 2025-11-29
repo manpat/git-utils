@@ -153,14 +153,29 @@ fn run() -> anyhow::Result<()> {
 			};
 
 			// TODO(pat.m): include upstream in list
-			let mut branch_list = git_list(["for-each-ref", "--format", "%(refname:lstrip=2)", refspec])?;
-			branch_list.retain(|branch| !branch.ends_with("/HEAD"));
-			if branch_list.is_empty() {
+			let mut full_branch_list = git_list(["for-each-ref", "--format", "%(refname:lstrip=2)", refspec])?;
+			full_branch_list.retain(|branch| !branch.ends_with("/HEAD"));
+			if full_branch_list.is_empty() {
 				anyhow::bail!("No branches to switch to.");
 			}
 
-			let index = list_prompt(&branch_list)?;
-			let selected_branch = branch_list[index].as_str();
+			let recent_branches = get_recent_branch_list(remote)?;
+
+			let mut ordered_branch_list = Vec::with_capacity(full_branch_list.len());
+
+			// Push recent branches _that still exist_ first, in the order they appear in reflog.
+			for recent_branch in recent_branches.iter() {
+				if let Some(position) = full_branch_list.iter().position(|branch| recent_branch == branch) {
+					let branch = full_branch_list.remove(position);
+					ordered_branch_list.push(branch);
+				}
+			}
+
+			// Push remaining non-recent branches in original order
+			ordered_branch_list.extend(full_branch_list);
+
+			let index = list_prompt(&ordered_branch_list)?;
+			let selected_branch = ordered_branch_list[index].as_str();
 
 			if remote {
 				let (_remote, local_branch) = selected_branch.split_once('/').context("git for-each-ref yielded info in unexpected format")?;
@@ -198,6 +213,36 @@ fn run() -> anyhow::Result<()> {
 fn detect_clean_worktree_and_index() -> anyhow::Result<bool> {
 	let modifications = git_list(["status", "--porcelain=1", "--untracked-files=no", "--ignored=no"])?;
 	Ok(modifications.is_empty())
+}
+
+fn get_recent_branch_list(remote: bool) -> anyhow::Result<Vec<String>> {
+	let reflog = git_list(["log", "--walk-reflogs", "--decorate=full", "-n100", "--format=format:%(decorate:prefix=,suffix=,pointer=>>>,separator=%x2c)"])?;
+
+	let ref_prefix = match remote {
+		false => "refs/heads/",
+		true => "refs/remotes/",
+	};
+
+	let mut branches: Vec<String> = Vec::with_capacity(reflog.len());
+	for entry in reflog {
+		if entry.trim().is_empty() || entry.contains(">>>") {
+			continue
+		}
+
+		for reference in entry.split(',') {
+			let Some(refname) = reference.strip_prefix(ref_prefix) else {
+				continue
+			};
+
+			if branches.iter().any(|branch| branch == refname) {
+				continue
+			}
+
+			branches.push(refname.to_owned());
+		}
+	}
+
+	Ok(branches)
 }
 
 fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {

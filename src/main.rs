@@ -273,7 +273,7 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 	let mut out = stdout();
 
 	let mut selected_index = 0usize;
-	let mut cursor_index = 0usize;
+	let mut caret_index = 0usize;
 	let mut offset = 0;
 	let mut filter_string = String::new();
 
@@ -358,7 +358,7 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 
 		execute!{
 			out,
-			cursor::MoveTo(cursor_start + cursor_index as u16, start_row),
+			cursor::MoveTo(cursor_start + caret_index as u16, start_row),
 			terminal::EndSynchronizedUpdate,
 		}?;
 
@@ -378,23 +378,23 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 						(KeyCode::Backspace, KeyModifiers::CONTROL) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
 							// Not quite right but whatever
 							filter_string.clear();
-							cursor_index = 0;
+							caret_index = 0;
 						}
 
-						(KeyCode::Backspace, _) => if let Some(index) = cursor_index.checked_sub(1) {
+						(KeyCode::Backspace, _) => if let Some(index) = caret_index.checked_sub(1) {
 							filter_string.remove(index);
-							cursor_index -= 1;
+							caret_index -= 1;
 						}
 
 						(KeyCode::Delete, _) => if !filter_string.is_empty() {
-							filter_string.remove(cursor_index);
+							filter_string.remove(caret_index);
 						}
 
-						(KeyCode::Home, _) => { cursor_index = 0; }
-						(KeyCode::End, _) => { cursor_index = filter_string.len(); }
+						(KeyCode::Home, _) => { caret_index = 0; }
+						(KeyCode::End, _) => { caret_index = filter_string.len(); }
 
-						(KeyCode::Left, _) => { cursor_index = cursor_index.saturating_sub(1); }
-						(KeyCode::Right, _) => { cursor_index += 1; }
+						(KeyCode::Left, _) => { caret_index = caret_index.saturating_sub(1); }
+						(KeyCode::Right, _) => { caret_index += 1; }
 
 						(KeyCode::Up, _) => { selected_index = selected_index.saturating_sub(1); }
 						(KeyCode::Down, _) => { selected_index += 1; }
@@ -406,8 +406,8 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 						(KeyCode::PageDown, _) => { selected_index += terminal_height as usize - 1; }
 
 						(KeyCode::Char(ch), _) => if ch.is_ascii() {
-							filter_string.insert(cursor_index, ch);
-							cursor_index += 1;
+							filter_string.insert(caret_index, ch);
+							caret_index += 1;
 						}
 
 						_ => {}
@@ -444,7 +444,7 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 		filtered_items.sort();
 
 		// Keep indices in bounds
-		cursor_index = cursor_index.min(filter_string.len());
+		caret_index = caret_index.min(filter_string.len());
 
 		if !filtered_items.is_empty() {
 			selected_index = selected_index.min(filtered_items.len() - 1);

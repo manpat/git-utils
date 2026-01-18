@@ -1,15 +1,21 @@
-use std::process::{Command, ExitCode};
 use anyhow::Context;
 use clap::Parser;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use std::io::{stdout};
+use std::process::ExitCode;
+use std::path::PathBuf;
+
 use crossterm::{
 	*,
 	tty::*,
 	event::*,
 };
+
+mod git;
+
+use git::*;
 
 #[derive(Parser, Debug)]
 #[command(version, author, about)]
@@ -17,6 +23,10 @@ struct MainArgs {
 	/// Log git commands to file.
 	#[arg(long, global=true)]
 	log: bool,
+
+	/// Override working directory.
+	#[arg(long, global=true)]
+	working_dir: Option<PathBuf>,
 
 	#[command(subcommand)]
 	subcommand: ArgCommand,
@@ -91,6 +101,8 @@ fn run() -> anyhow::Result<()> {
 		}.unwrap();
 	});
 
+	let git = GitContext::new(&args);
+
 	match args.subcommand {
 		ArgCommand::Install { system, local, .. } => {
 			let current_path = std::env::current_exe()?;
@@ -136,14 +148,14 @@ fn run() -> anyhow::Result<()> {
 			for (alias, command) in aliases {
 				let config_name = format!("alias.{alias}");
 				let config_command = format!("!{} {command}", current_path_fixed.display());
-				git_run(args.iter().cloned().chain([config_name.as_str(), config_command.as_str()]))?;
+				git.run(args.iter().cloned().chain([config_name.as_str(), config_command.as_str()]))?;
 
 				println!("Aliasing `git {alias}` to `git-utils {command}`");
 			}
 		}
 
 		ArgCommand::Switch { remote } => {
-			if !detect_clean_worktree_and_index()? {
+			if !detect_clean_worktree_and_index(&git)? {
 				anyhow::bail!("There are changes in the index/worktree which must be committed, reverted, or stashed before switching branches");
 			}
 
@@ -153,13 +165,13 @@ fn run() -> anyhow::Result<()> {
 			};
 
 			// TODO(pat.m): include upstream in list
-			let mut full_branch_list = git_list(["for-each-ref", "--format", "%(refname:lstrip=2)", refspec])?;
+			let mut full_branch_list = git.query_list(["for-each-ref", "--format", "%(refname:lstrip=2)", refspec])?;
 			full_branch_list.retain(|branch| !branch.ends_with("/HEAD"));
 			if full_branch_list.is_empty() {
 				anyhow::bail!("No branches to switch to.");
 			}
 
-			let recent_branches = get_recent_branch_list(remote)?;
+			let recent_branches = get_recent_branch_list(&git, remote)?;
 
 			let mut ordered_branch_list = Vec::with_capacity(full_branch_list.len());
 
@@ -180,8 +192,8 @@ fn run() -> anyhow::Result<()> {
 			if remote {
 				let (_remote, local_branch) = selected_branch.split_once('/').context("git for-each-ref yielded info in unexpected format")?;
 
-				if ref_exists(&format!("refs/heads/{local_branch}"))? {
-					match get_upstream(local_branch)? {
+				if ref_exists(&git, &format!("refs/heads/{local_branch}"))? {
+					match get_upstream(&git, local_branch)? {
 						Some(current_upstream) => {
 							if current_upstream != selected_branch {
 								anyhow::bail!("Branch with name '{local_branch}' already exists but has different tracking branch '{current_upstream}' (expected '{selected_branch}')")
@@ -193,15 +205,15 @@ fn run() -> anyhow::Result<()> {
 						}
 					}
 
-					git_run(["switch", local_branch])?;
+					git.run(["switch", local_branch])?;
 					println!("Switched to branch {local_branch}, tracking {selected_branch}");
 				} else {
-					git_run(["switch", "--track", selected_branch, "--create", local_branch])?;
+					git.run(["switch", "--track", selected_branch, "--create", local_branch])?;
 					println!("Switched to new branch {local_branch}, tracking {selected_branch}");
 				}
 
 			} else {
-				git_run(["switch", selected_branch])?;
+				git.run(["switch", selected_branch])?;
 				println!("Switched to branch {selected_branch}");
 			}
 		}
@@ -210,13 +222,13 @@ fn run() -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn detect_clean_worktree_and_index() -> anyhow::Result<bool> {
-	let modifications = git_list(["status", "--porcelain=1", "--untracked-files=no", "--ignored=no"])?;
+fn detect_clean_worktree_and_index(git: &GitContext) -> anyhow::Result<bool> {
+	let modifications = git.query_list(["status", "--porcelain=1", "--untracked-files=no", "--ignored=no"])?;
 	Ok(modifications.is_empty())
 }
 
-fn get_recent_branch_list(remote: bool) -> anyhow::Result<Vec<String>> {
-	let reflog = git_list(["log", "--walk-reflogs", "--decorate=full", "-n100", "--format=format:%(decorate:prefix=,suffix=,pointer=>>>,separator=%x2c)"])?;
+fn get_recent_branch_list(git: &GitContext, remote: bool) -> anyhow::Result<Vec<String>> {
+	let reflog = git.query_list(["log", "--walk-reflogs", "--decorate=full", "-n100", "--format=format:%(decorate:prefix=,suffix=,pointer=>>>,separator=%x2c)"])?;
 
 	let ref_prefix = match remote {
 		false => "refs/heads/",
@@ -244,6 +256,16 @@ fn get_recent_branch_list(remote: bool) -> anyhow::Result<Vec<String>> {
 
 	Ok(branches)
 }
+
+fn ref_exists(git: &GitContext, refname: &str) -> anyhow::Result<bool> {
+	git.query_success(["show-ref", "--quiet", refname])
+}
+
+fn get_upstream(git: &GitContext, branch: &str) -> anyhow::Result<Option<String>> {
+	git.try_query(["rev-parse", "--quiet", "--abbrev-ref", "--verify", &format!("{branch}@{{upstream}}")])
+}
+
+
 
 fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 	anyhow::ensure!(!items.is_empty());
@@ -424,98 +446,6 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 
 	Ok(filtered_items[selected_index].original_index)
 }
-
-struct GitOutput {
-	code: i32,
-	stdout: String,
-	stderr: String,
-}
-
-fn git_raw<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<GitOutput>
-	where S: AsRef<std::ffi::OsStr>
-{
-	let args: Vec<_> = args.into_iter().collect();
-	let arg_strings: Vec<_> = args.iter().map(AsRef::as_ref).collect();
-
-	log::info!("> git {arg_strings:?}");
-
-	let output = Command::new("git")
-		.args(args)
-		.output()?;
-
-	let code = output.status.code().unwrap_or(i32::MAX);
-	log::info!(" -> status: {code}");
-
-	let stdout = std::str::from_utf8(&output.stdout)?.trim().to_owned();
-	let stderr = std::str::from_utf8(&output.stderr)?.trim().to_owned();
-
-	Ok(GitOutput {
-		code,
-		stdout,
-		stderr,
-	})
-}
-
-fn git_run<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<()>
-	where S: AsRef<std::ffi::OsStr>
-{
-	let GitOutput{code, stderr, ..} = git_raw(args)?;
-
-	if code != 0 {
-		log::error!("{stderr}");
-		anyhow::bail!("{stderr}");
-	}
-
-	Ok(())
-}
-
-fn git_stdout<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<String>
-	where S: AsRef<std::ffi::OsStr>
-{
-	let GitOutput{code, stdout, stderr} = git_raw(args)?;
-
-	if code != 0 {
-		log::error!("{stderr}");
-		anyhow::bail!("{stderr}");
-	}
-
-	Ok(stdout)
-}
-
-fn ref_exists(refname: &str) -> anyhow::Result<bool> {
-	let GitOutput{code, stderr, ..} = git_raw(["show-ref", "--quiet", refname])?;
-
-	match code {
-		0 => return Ok(true),
-		1 => return Ok(false),
-		_ => {}
-	}
-
-	anyhow::bail!("{stderr}");
-}
-
-fn get_upstream(branch: &str) -> anyhow::Result<Option<String>> {
-	let GitOutput{code, stdout, stderr} = git_raw(["rev-parse", "--quiet", "--abbrev-ref", "--verify", &format!("{branch}@{{upstream}}")])?;
-
-	match code {
-		0 => return Ok(Some(stdout)),
-		1 => return Ok(None),
-		_ => {}
-	}
-
-	anyhow::bail!("{stderr}");
-}
-
-fn git_list<S>(args: impl IntoIterator<Item=S>) -> anyhow::Result<Vec<String>>
-	where S: AsRef<std::ffi::OsStr>
-{
-	git_stdout(args)?
-		.lines()
-		.map(String::from)
-		.map(Ok)
-		.collect()
-}
-
 
 
 fn start_raw_mode() -> anyhow::Result<impl Drop> {

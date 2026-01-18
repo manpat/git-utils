@@ -1,12 +1,12 @@
-use std::io::{stdout, Stdout};
+use std::io::{stdout, Stdout, Write};
 use std::fmt::Display;
 
 use crate::on_drop;
 
 use crossterm::{
 	*,
-	tty::*,
 	event::*,
+	style::Color,
 };
 
 use fuzzy_matcher::FuzzyMatcher;
@@ -21,15 +21,17 @@ struct ListItem<T> {
 
 pub struct FilterableList<T> {
 	items: Vec<ListItem<T>>,
+	prompt_text: String,
 
 	filtered_items: Vec<usize>,
 	needs_refilter: bool,
 }
 
 impl<T> FilterableList<T> {
-	pub fn new() -> Self {
+	pub fn new(prompt_text: impl Into<String>) -> Self {
 		FilterableList {
 			items: Vec::new(),
+			prompt_text: prompt_text.into(),
 
 			filtered_items: Vec::new(),
 			needs_refilter: false,
@@ -56,40 +58,12 @@ impl<T> FilterableList<T> {
 	pub fn run(mut self) -> anyhow::Result<T> {
 		anyhow::ensure!(!self.items.is_empty());
 
-		let mut out = stdout();
+		let mut viewport = InlineViewport::start(self.items.len() + 1)?;
 
 		let mut selected_index = 0usize;
 		let mut caret_index = 0usize;
 		let mut offset = 0;
 		let mut filter_string = String::new();
-
-		let (_, mut terminal_height) = terminal::size()?;
-		let desired_height = terminal_height.min(self.items.len() as u16 + 1);
-		let mut max_visible_items = desired_height as usize - 1;
-
-		// Clear enough space
-		{
-			let num_newlines = desired_height.saturating_sub(1);
-			for _ in 0..num_newlines { print!("\n"); }
-			execute!{out, cursor::MoveUp(num_newlines)}?;
-		}
-
-		execute!{
-			out,
-			terminal::DisableLineWrap,
-		}?;
-
-		let start_row = cursor::position()?.1;
-
-		let _guard = on_drop(|| {
-			execute!{
-				stdout(),
-				cursor::MoveTo(0, start_row),
-				terminal::Clear(terminal::ClearType::FromCursorDown),
-				style::ResetColor,
-				terminal::EnableLineWrap,
-			}.unwrap();
-		});
 
 		let matcher = SkimMatcherV2::default();
 
@@ -109,43 +83,73 @@ impl<T> FilterableList<T> {
 			.collect();
 
 		'main: loop {
-			execute!{
-				out,
-				terminal::BeginSynchronizedUpdate,
+			let max_visible_items = viewport.usable_height() as usize - 1;
 
-				cursor::MoveTo(0, start_row),
-				terminal::Clear(terminal::ClearType::FromCursorDown),
-				style::Print("Switch to branch: "),
-			}?;
+			self.needs_refilter = true;
 
-			let cursor_start = cursor::position()?.0;
+			// Refilter
+			if self.needs_refilter {
+				self.needs_refilter = false;
+				filtered_items.clear();
+				filtered_items.extend(
+					self.items.iter().enumerate()
+						.filter_map(|(index, item)| {
+							matcher.fuzzy_match(&item.display, &filter_string)
+								.map(|score| FilteredItem {
+									score: -score,
+									original_index: index,
+									text: item.display.as_str(),
+								})
+						})
+				);
 
-			print!("{filter_string}");
-
-			// Render list.
-			for (index, &FilteredItem{ text, .. }) in filtered_items.iter().enumerate().skip(offset).take(max_visible_items) {
-				let is_selected = index == selected_index;
-				let marker = match is_selected {
-					true => '>',
-					false => ' ',
-				};
-
-				if is_selected {
-					queue!{
-						out, 
-						style::SetForegroundColor(style::Color::Black),
-						style::SetBackgroundColor(style::Color::White),
-					}?;
-				}
-
-				print!("\n{marker} {text}{}", style::ResetColor);
+				filtered_items.sort();
 			}
 
-			execute!{
-				out,
-				cursor::MoveTo(cursor_start + caret_index as u16, start_row),
-				terminal::EndSynchronizedUpdate,
-			}?;
+			// Keep indices in bounds
+			caret_index = caret_index.min(filter_string.len());
+
+			if !filtered_items.is_empty() {
+				selected_index = selected_index.min(filtered_items.len() - 1);
+			}
+
+			// Make sure max number of items possible are visible.
+			offset = offset.min(filtered_items.len().saturating_sub(max_visible_items));
+
+			// Make sure selection is in view
+			if selected_index >= offset + max_visible_items {
+				offset = selected_index - max_visible_items + 1;
+			} else if selected_index < offset {
+				offset = selected_index;
+			}
+
+			viewport.draw(|mut ctx| {
+				ctx.print(&self.prompt_text);
+				ctx.print(&filter_string);
+
+				// Render list.
+				for (row, (filter_index, &FilteredItem{ text, .. })) in filtered_items.iter().enumerate().skip(offset).take(max_visible_items).enumerate() {
+					let is_selected = filter_index == selected_index;
+					let marker = match is_selected {
+						true => '>',
+						false => ' ',
+					};
+
+					if is_selected {
+						ctx.set_fg_color(Color::Black);
+						ctx.set_bg_color(Color::White);
+
+						ctx.print_at("> ", row as u16 + 1, 0);
+					}
+
+					ctx.print_at(text, row as u16 + 1, 2);
+
+					ctx.reset_color();
+				}
+
+				// Move visual cursor to caret position
+				ctx.move_to(0, self.prompt_text.len() as u16 + caret_index as u16);
+			});
 
 			let _guard = start_raw_mode()?;
 
@@ -187,8 +191,8 @@ impl<T> FilterableList<T> {
 							(KeyCode::PageUp, KeyModifiers::CONTROL) => { selected_index = 0; }
 							(KeyCode::PageDown, KeyModifiers::CONTROL) => { selected_index = filtered_items.len(); }
 
-							(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(terminal_height as usize - 1); }
-							(KeyCode::PageDown, _) => { selected_index += terminal_height as usize - 1; }
+							(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(max_visible_items); }
+							(KeyCode::PageDown, _) => { selected_index += max_visible_items; }
 
 							(KeyCode::Char(ch), _) => if ch.is_ascii() {
 								filter_string.insert(caret_index, ch);
@@ -202,44 +206,13 @@ impl<T> FilterableList<T> {
 					}
 
 					Event::Resize(width, height) => {
-						terminal_height = height;
-						let desired_height = terminal_height.min(self.items.len() as u16 + 1);
-						max_visible_items = desired_height as usize - 1;
+						viewport.terminal_width = width;
+						viewport.terminal_height = height;
 						break 'events
 					}
 
 					_ => {}
 				}
-			}
-
-			// Refilter
-			filtered_items.clear();
-			filtered_items.extend(
-				self.items.iter().enumerate()
-					.filter_map(|(index, item)| {
-						matcher.fuzzy_match(&item.display, &filter_string)
-							.map(|score| FilteredItem {
-								score: -score,
-								original_index: index,
-								text: item.display.as_str(),
-							})
-					})
-			);
-
-			filtered_items.sort();
-
-			// Keep indices in bounds
-			caret_index = caret_index.min(filter_string.len());
-
-			if !filtered_items.is_empty() {
-				selected_index = selected_index.min(filtered_items.len() - 1);
-			}
-
-			// Make sure selection is in view
-			if selected_index >= offset + max_visible_items {
-				offset = selected_index - max_visible_items + 1;
-			} else if selected_index < offset {
-				offset = selected_index;
 			}
 		}
 
@@ -256,6 +229,60 @@ impl<T> FilterableList<T> {
 
 
 
+pub struct ViewportDrawContext {
+	pub out: Stdout,
+
+	pub start_row: u16,
+	pub usable_width: u16,
+	pub usable_height: u16,
+}
+
+impl Drop for ViewportDrawContext {
+	fn drop(&mut self) {
+		let _ = self.out.execute(terminal::EndSynchronizedUpdate);
+	}
+}
+
+impl ViewportDrawContext {
+	// pub fn flush(&mut self) {
+	// 	self.out.flush().unwrap();
+	// }
+
+	pub fn print(&mut self, s: impl AsRef<str>) {
+		self.out.queue(style::Print(s.as_ref())).unwrap();
+	}
+
+	pub fn print_at(&mut self, s: impl AsRef<str>, row: u16, column: u16) {
+		self.move_to(row, column);
+		self.out.queue(style::Print(s.as_ref())).unwrap();
+	}
+
+	pub fn move_to(&mut self, row: u16, column: u16) {
+		self.out.queue(cursor::MoveTo(column, self.start_row + row)).unwrap();
+	}
+
+	pub fn set_fg_color(&mut self, color: Color) {
+		self.out.queue(style::SetForegroundColor(color)).unwrap();
+	}
+
+	pub fn set_bg_color(&mut self, color: Color) {
+		self.out.queue(style::SetBackgroundColor(color)).unwrap();
+	}
+
+	pub fn reset_color(&mut self) {
+		self.out.queue(style::ResetColor).unwrap();
+	}
+
+	// pub fn cursor_column(&mut self) -> u16 {
+	// 	self.flush();
+	// 	cursor::position().unwrap().0
+	// }
+
+	// pub fn cursor_row(&mut self) -> u16 {
+	// 	self.flush();
+	// 	cursor::position().unwrap().1 - self.start_row
+	// }
+}
 
 
 
@@ -305,6 +332,24 @@ impl InlineViewport {
 
 	pub fn usable_height(&self) -> u16 {
 		(self.terminal_height as usize).min(self.desired_height) as u16
+	}
+
+	pub fn draw(&mut self, f: impl FnOnce(ViewportDrawContext)) {
+		execute!{
+			self.out,
+			terminal::BeginSynchronizedUpdate,
+
+			cursor::MoveTo(0, self.start_row),
+			terminal::Clear(terminal::ClearType::FromCursorDown),
+		}.unwrap();
+
+		f(ViewportDrawContext {
+			out: stdout(),
+
+			start_row: self.start_row,
+			usable_width: self.terminal_width,
+			usable_height: self.usable_height(),
+		});
 	}
 }
 

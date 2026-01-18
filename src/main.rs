@@ -91,6 +91,10 @@ fn run() -> anyhow::Result<()> {
 		use std::fs::File;
 		let log_file = File::create("git-utils.log")?;
 		simplelog::WriteLogger::init(log::LevelFilter::Info, simplelog::Config::default(), log_file)?;
+
+		unsafe {
+			std::env::set_var("RUST_BACKTRACE", "full");
+		}
 	}
 
 	let _guard = on_drop(|| {
@@ -172,7 +176,7 @@ fn run() -> anyhow::Result<()> {
 
 			let recent_branches = get_recent_branch_list(&git, remote)?;
 
-			let mut list_model = ui::FilterableList::new();
+			let mut list_model = ui::FilterableList::new("Switch to branch: ");
 
 			// Push recent branches _that still exist_ first, in the order they appear in reflog.
 			for recent_branch in recent_branches.iter() {
@@ -187,8 +191,6 @@ fn run() -> anyhow::Result<()> {
 				list_model.insert_formatted(recent_branch);
 			}
 
-			// let index = list_prompt(&ordered_branch_list)?;
-			// let selected_branch = ordered_branch_list[index].as_str();
 			let selected_branch = list_model.run()?;
 
 			if remote {

@@ -323,14 +323,11 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 		})
 		.collect();
 
-	loop {
+	'main: loop {
 		execute!{
 			out,
 			terminal::BeginSynchronizedUpdate,
-		}?;
 
-		execute!{
-			out,
 			cursor::MoveTo(0, start_row),
 			terminal::Clear(terminal::ClearType::FromCursorDown),
 			style::Print("Switch to branch: "),
@@ -367,60 +364,67 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 
 		let _guard = start_raw_mode()?;
 
-		match event::read()? {
-			Event::Key(KeyEvent{ code, modifiers, kind: KeyEventKind::Press, .. }) => match (code, modifiers) {
-				(KeyCode::Enter, _) if !filtered_items.is_empty() => break,
+		'events: loop {
+			match event::read()? {
+				Event::Key(KeyEvent{ code, modifiers, kind: KeyEventKind::Press, .. }) => {
+					match (code, modifiers) {
+						(KeyCode::Enter, _) if !filtered_items.is_empty() => break 'main,
 
-				(KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-					anyhow::bail!("Cancelled")
+						(KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+							anyhow::bail!("Cancelled")
+						}
+
+						// Note: ctrl+backspace produces ^h on my machine.
+						(KeyCode::Backspace, KeyModifiers::CONTROL) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+							// Not quite right but whatever
+							filter_string.clear();
+							cursor_index = 0;
+						}
+
+						(KeyCode::Backspace, _) => if let Some(index) = cursor_index.checked_sub(1) {
+							filter_string.remove(index);
+							cursor_index -= 1;
+						}
+
+						(KeyCode::Delete, _) => if !filter_string.is_empty() {
+							filter_string.remove(cursor_index);
+						}
+
+						(KeyCode::Home, _) => { cursor_index = 0; }
+						(KeyCode::End, _) => { cursor_index = filter_string.len(); }
+
+						(KeyCode::Left, _) => { cursor_index = cursor_index.saturating_sub(1); }
+						(KeyCode::Right, _) => { cursor_index += 1; }
+
+						(KeyCode::Up, _) => { selected_index = selected_index.saturating_sub(1); }
+						(KeyCode::Down, _) => { selected_index += 1; }
+
+						(KeyCode::PageUp, KeyModifiers::CONTROL) => { selected_index = 0; }
+						(KeyCode::PageDown, KeyModifiers::CONTROL) => { selected_index = filtered_items.len(); }
+
+						(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(terminal_height as usize - 1); }
+						(KeyCode::PageDown, _) => { selected_index += terminal_height as usize - 1; }
+
+						(KeyCode::Char(ch), _) => if ch.is_ascii() {
+							filter_string.insert(cursor_index, ch);
+							cursor_index += 1;
+						}
+
+						_ => {}
+					}
+
+					break 'events
 				}
 
-				// Note: ctrl+backspace produces ^h on my machine.
-				(KeyCode::Backspace, KeyModifiers::CONTROL) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-					// Not quite right but whatever
-					filter_string.clear();
-					cursor_index = 0;
-				}
-
-				(KeyCode::Backspace, _) => if let Some(index) = cursor_index.checked_sub(1) {
-					filter_string.remove(index);
-					cursor_index -= 1;
-				}
-
-				(KeyCode::Delete, _) => if !filter_string.is_empty() {
-					filter_string.remove(cursor_index);
-				}
-
-				(KeyCode::Home, _) => { cursor_index = 0; }
-				(KeyCode::End, _) => { cursor_index = filter_string.len(); }
-
-				(KeyCode::Left, _) => { cursor_index = cursor_index.saturating_sub(1); }
-				(KeyCode::Right, _) => { cursor_index += 1; }
-
-				(KeyCode::Up, _) => { selected_index = selected_index.saturating_sub(1); }
-				(KeyCode::Down, _) => { selected_index += 1; }
-
-				(KeyCode::PageUp, KeyModifiers::CONTROL) => { selected_index = 0; }
-				(KeyCode::PageDown, KeyModifiers::CONTROL) => { selected_index = filtered_items.len(); }
-
-				(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(terminal_height as usize - 1); }
-				(KeyCode::PageDown, _) => { selected_index += terminal_height as usize - 1; }
-
-				(KeyCode::Char(ch), _) => if ch.is_ascii() {
-					filter_string.insert(cursor_index, ch);
-					cursor_index += 1;
+				Event::Resize(width, height) => {
+					terminal_height = height;
+					let desired_height = terminal_height.min(items.len() as u16 + 1);
+					max_visible_items = desired_height as usize - 1;
+					break 'events
 				}
 
 				_ => {}
 			}
-
-			Event::Resize(width, height) => {
-				terminal_height = height;
-				let desired_height = terminal_height.min(items.len() as u16 + 1);
-				max_visible_items = desired_height as usize - 1;
-			}
-
-			_ => {}
 		}
 
 		// Refilter

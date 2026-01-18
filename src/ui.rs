@@ -67,54 +67,45 @@ impl<T> FilterableList<T> {
 
 		let matcher = SkimMatcherV2::default();
 
-		#[derive(Ord, PartialOrd, Eq, PartialEq)]
-		struct FilteredItem<'s> {
-			score: i64,
-			original_index: usize,
-			text: &'s str,
-		}
-
-		let mut filtered_items: Vec<_> = self.items.iter().enumerate()
-			.map(|(index, item)| FilteredItem {
-				score: 0,
-				original_index: index,
-				text: item.display.as_str(),
-			})
-			.collect();
-
 		'main: loop {
 			let max_visible_items = viewport.usable_height() as usize - 1;
-
-			self.needs_refilter = true;
 
 			// Refilter
 			if self.needs_refilter {
 				self.needs_refilter = false;
-				filtered_items.clear();
-				filtered_items.extend(
-					self.items.iter().enumerate()
-						.filter_map(|(index, item)| {
-							matcher.fuzzy_match(&item.display, &filter_string)
-								.map(|score| FilteredItem {
-									score: -score,
-									original_index: index,
-									text: item.display.as_str(),
-								})
-						})
-				);
 
-				filtered_items.sort();
+				#[derive(Ord, PartialOrd, Eq, PartialEq)]
+				struct ScoredItem {
+					score: i64,
+					original_index: usize,
+				}
+
+				let mut item_scores: Vec<ScoredItem> = self.items.iter().enumerate()
+					.filter_map(|(index, item)| {
+						matcher.fuzzy_match(&item.display, &filter_string)
+							.map(|score| ScoredItem {
+								score: -score,
+								original_index: index,
+							})
+					})
+					.collect();
+
+				item_scores.sort();
+
+				self.filtered_items = item_scores.into_iter()
+					.map(|item| item.original_index)
+					.collect();
 			}
 
 			// Keep indices in bounds
 			caret_index = caret_index.min(filter_string.len());
 
-			if !filtered_items.is_empty() {
-				selected_index = selected_index.min(filtered_items.len() - 1);
+			if !self.filtered_items.is_empty() {
+				selected_index = selected_index.min(self.filtered_items.len() - 1);
 			}
 
 			// Make sure max number of items possible are visible.
-			offset = offset.min(filtered_items.len().saturating_sub(max_visible_items));
+			offset = offset.min(self.filtered_items.len().saturating_sub(max_visible_items));
 
 			// Make sure selection is in view
 			if selected_index >= offset + max_visible_items {
@@ -128,13 +119,13 @@ impl<T> FilterableList<T> {
 				ctx.print(&filter_string);
 
 				// Render list.
-				for (row, (filter_index, &FilteredItem{ text, .. })) in filtered_items.iter().enumerate().skip(offset).take(max_visible_items).enumerate() {
-					let is_selected = filter_index == selected_index;
-					let marker = match is_selected {
-						true => '>',
-						false => ' ',
-					};
-
+				for (row, &item_index) in
+					self.filtered_items.iter()
+						.skip(offset).take(max_visible_items)
+						.enumerate()
+				{
+					let filtered_index = row + offset;
+					let is_selected = filtered_index == selected_index;
 					if is_selected {
 						ctx.set_fg_color(Color::Black);
 						ctx.set_bg_color(Color::White);
@@ -142,6 +133,7 @@ impl<T> FilterableList<T> {
 						ctx.print_at("> ", row as u16 + 1, 0);
 					}
 
+					let text = &self.items[item_index].display;
 					ctx.print_at(text, row as u16 + 1, 2);
 
 					ctx.reset_color();
@@ -151,13 +143,11 @@ impl<T> FilterableList<T> {
 				ctx.move_to(0, self.prompt_text.len() as u16 + caret_index as u16);
 			});
 
-			let _guard = start_raw_mode()?;
-
 			'events: loop {
 				match event::read()? {
 					Event::Key(KeyEvent{ code, modifiers, kind: KeyEventKind::Press, .. }) => {
 						match (code, modifiers) {
-							(KeyCode::Enter, _) if !filtered_items.is_empty() => break 'main,
+							(KeyCode::Enter, _) if !self.filtered_items.is_empty() => break 'main,
 
 							(KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
 								anyhow::bail!("Cancelled")
@@ -168,15 +158,18 @@ impl<T> FilterableList<T> {
 								// Not quite right but whatever
 								filter_string.clear();
 								caret_index = 0;
+								self.needs_refilter = true;
 							}
 
 							(KeyCode::Backspace, _) => if let Some(index) = caret_index.checked_sub(1) {
 								filter_string.remove(index);
 								caret_index -= 1;
+								self.needs_refilter = true;
 							}
 
 							(KeyCode::Delete, _) => if !filter_string.is_empty() {
 								filter_string.remove(caret_index);
+								self.needs_refilter = true;
 							}
 
 							(KeyCode::Home, _) => { caret_index = 0; }
@@ -189,7 +182,7 @@ impl<T> FilterableList<T> {
 							(KeyCode::Down, _) => { selected_index += 1; }
 
 							(KeyCode::PageUp, KeyModifiers::CONTROL) => { selected_index = 0; }
-							(KeyCode::PageDown, KeyModifiers::CONTROL) => { selected_index = filtered_items.len(); }
+							(KeyCode::PageDown, KeyModifiers::CONTROL) => { selected_index = self.filtered_items.len(); }
 
 							(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(max_visible_items); }
 							(KeyCode::PageDown, _) => { selected_index += max_visible_items; }
@@ -197,6 +190,7 @@ impl<T> FilterableList<T> {
 							(KeyCode::Char(ch), _) => if ch.is_ascii() {
 								filter_string.insert(caret_index, ch);
 								caret_index += 1;
+								self.needs_refilter = true;
 							}
 
 							_ => {}
@@ -216,9 +210,9 @@ impl<T> FilterableList<T> {
 			}
 		}
 
-		anyhow::ensure!(selected_index < filtered_items.len());
+		anyhow::ensure!(selected_index < self.filtered_items.len());
 
-		let item_index = filtered_items[selected_index].original_index;
+		let item_index = self.filtered_items[selected_index];
 		Ok(self.items.remove(item_index).value)
 	}
 }
@@ -317,6 +311,8 @@ impl InlineViewport {
 
 		let start_row = cursor::position()?.1;
 
+		terminal::enable_raw_mode()?;
+
 		Ok(InlineViewport {
 			out,
 
@@ -335,13 +331,13 @@ impl InlineViewport {
 	}
 
 	pub fn draw(&mut self, f: impl FnOnce(ViewportDrawContext)) {
-		execute!{
+		let _ = queue!{
 			self.out,
 			terminal::BeginSynchronizedUpdate,
 
 			cursor::MoveTo(0, self.start_row),
 			terminal::Clear(terminal::ClearType::FromCursorDown),
-		}.unwrap();
+		};
 
 		f(ViewportDrawContext {
 			out: stdout(),
@@ -356,6 +352,7 @@ impl InlineViewport {
 
 impl Drop for InlineViewport {
 	fn drop(&mut self) {
+		let _ = terminal::disable_raw_mode();
 		let _ = execute!{
 			self.out,
 			cursor::MoveTo(0, self.start_row),
@@ -366,14 +363,3 @@ impl Drop for InlineViewport {
 	}
 }
 
-
-
-
-
-
-fn start_raw_mode() -> anyhow::Result<impl Drop> {
-	terminal::enable_raw_mode()?;
-	Ok(on_drop(|| {
-		terminal::disable_raw_mode().unwrap()
-	}))
-}

@@ -277,9 +277,9 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 	let mut offset = 0;
 	let mut filter_string = String::new();
 
-	let (_, terminal_height) = terminal::size()?;
+	let (_, mut terminal_height) = terminal::size()?;
 	let desired_height = terminal_height.min(items.len() as u16 + 1);
-	let max_visible_items = desired_height as usize - 1;
+	let mut max_visible_items = desired_height as usize - 1;
 
 	// Clear enough space
 	{
@@ -287,6 +287,11 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 		for _ in 0..num_newlines { print!("\n"); }
 		execute!{out, cursor::MoveUp(num_newlines)}?;
 	}
+
+	execute!{
+		out,
+		terminal::DisableLineWrap,
+	}?;
 
 	let start_row = cursor::position()?.1;
 
@@ -296,6 +301,7 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 			cursor::MoveTo(0, start_row),
 			terminal::Clear(terminal::ClearType::FromCursorDown),
 			style::ResetColor,
+			terminal::EnableLineWrap,
 		}.unwrap();
 	});
 
@@ -406,6 +412,12 @@ fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
 				}
 
 				_ => {}
+			}
+
+			Event::Resize(width, height) => {
+				terminal_height = height;
+				let desired_height = terminal_height.min(items.len() as u16 + 1);
+				max_visible_items = desired_height as usize - 1;
 			}
 
 			_ => {}

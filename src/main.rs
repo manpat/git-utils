@@ -1,7 +1,5 @@
 use anyhow::Context;
 use clap::Parser;
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 
 use std::io::{stdout};
 use std::process::ExitCode;
@@ -14,6 +12,7 @@ use crossterm::{
 };
 
 mod git;
+mod ui;
 
 use git::*;
 
@@ -173,21 +172,24 @@ fn run() -> anyhow::Result<()> {
 
 			let recent_branches = get_recent_branch_list(&git, remote)?;
 
-			let mut ordered_branch_list = Vec::with_capacity(full_branch_list.len());
+			let mut list_model = ui::FilterableList::new();
 
 			// Push recent branches _that still exist_ first, in the order they appear in reflog.
 			for recent_branch in recent_branches.iter() {
 				if let Some(position) = full_branch_list.iter().position(|branch| recent_branch == branch) {
 					let branch = full_branch_list.remove(position);
-					ordered_branch_list.push(branch);
+					list_model.insert_formatted(branch);
 				}
 			}
 
 			// Push remaining non-recent branches in original order
-			ordered_branch_list.extend(full_branch_list);
+			for recent_branch in full_branch_list {
+				list_model.insert_formatted(recent_branch);
+			}
 
-			let index = list_prompt(&ordered_branch_list)?;
-			let selected_branch = ordered_branch_list[index].as_str();
+			// let index = list_prompt(&ordered_branch_list)?;
+			// let selected_branch = ordered_branch_list[index].as_str();
+			let selected_branch = list_model.run()?;
 
 			if remote {
 				let (_remote, local_branch) = selected_branch.split_once('/').context("git for-each-ref yielded info in unexpected format")?;
@@ -208,12 +210,12 @@ fn run() -> anyhow::Result<()> {
 					git.run(["switch", local_branch])?;
 					println!("Switched to branch {local_branch}, tracking {selected_branch}");
 				} else {
-					git.run(["switch", "--track", selected_branch, "--create", local_branch])?;
+					git.run(["switch", "--track", &selected_branch, "--create", local_branch])?;
 					println!("Switched to new branch {local_branch}, tracking {selected_branch}");
 				}
 
 			} else {
-				git.run(["switch", selected_branch])?;
+				git.run(["switch", &selected_branch])?;
 				println!("Switched to branch {selected_branch}");
 			}
 		}
@@ -267,212 +269,7 @@ fn get_upstream(git: &GitContext, branch: &str) -> anyhow::Result<Option<String>
 
 
 
-fn list_prompt<I: std::fmt::Display>(items: &[I]) -> anyhow::Result<usize> {
-	anyhow::ensure!(!items.is_empty());
-
-	let mut out = stdout();
-
-	let mut selected_index = 0usize;
-	let mut caret_index = 0usize;
-	let mut offset = 0;
-	let mut filter_string = String::new();
-
-	let (_, mut terminal_height) = terminal::size()?;
-	let desired_height = terminal_height.min(items.len() as u16 + 1);
-	let mut max_visible_items = desired_height as usize - 1;
-
-	// Clear enough space
-	{
-		let num_newlines = desired_height.saturating_sub(1);
-		for _ in 0..num_newlines { print!("\n"); }
-		execute!{out, cursor::MoveUp(num_newlines)}?;
-	}
-
-	execute!{
-		out,
-		terminal::DisableLineWrap,
-	}?;
-
-	let start_row = cursor::position()?.1;
-
-	let _guard = on_drop(|| {
-		execute!{
-			stdout(),
-			cursor::MoveTo(0, start_row),
-			terminal::Clear(terminal::ClearType::FromCursorDown),
-			style::ResetColor,
-			terminal::EnableLineWrap,
-		}.unwrap();
-	});
-
-	let matcher = SkimMatcherV2::default();
-	let item_strings: Vec<_> = items.iter().map(|item| item.to_string()).collect();
-
-	#[derive(Ord, PartialOrd, Eq, PartialEq)]
-	struct FilteredItem<'s> {
-		score: i64,
-		original_index: usize,
-		text: &'s str,
-	}
-
-	let mut filtered_items: Vec<_> = item_strings.iter().enumerate()
-		.map(|(index, item)| FilteredItem {
-			score: 0,
-			original_index: index,
-			text: item,
-		})
-		.collect();
-
-	'main: loop {
-		execute!{
-			out,
-			terminal::BeginSynchronizedUpdate,
-
-			cursor::MoveTo(0, start_row),
-			terminal::Clear(terminal::ClearType::FromCursorDown),
-			style::Print("Switch to branch: "),
-		}?;
-
-		let cursor_start = cursor::position()?.0;
-
-		print!("{filter_string}");
-
-		// Render list.
-		for (index, &FilteredItem{ text, .. }) in filtered_items.iter().enumerate().skip(offset).take(max_visible_items) {
-			let is_selected = index == selected_index;
-			let marker = match is_selected {
-				true => '>',
-				false => ' ',
-			};
-
-			if is_selected {
-				queue!{
-					out, 
-					style::SetForegroundColor(style::Color::Black),
-					style::SetBackgroundColor(style::Color::White),
-				}?;
-			}
-
-			print!("\n{marker} {text}{}", style::ResetColor);
-		}
-
-		execute!{
-			out,
-			cursor::MoveTo(cursor_start + caret_index as u16, start_row),
-			terminal::EndSynchronizedUpdate,
-		}?;
-
-		let _guard = start_raw_mode()?;
-
-		'events: loop {
-			match event::read()? {
-				Event::Key(KeyEvent{ code, modifiers, kind: KeyEventKind::Press, .. }) => {
-					match (code, modifiers) {
-						(KeyCode::Enter, _) if !filtered_items.is_empty() => break 'main,
-
-						(KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-							anyhow::bail!("Cancelled")
-						}
-
-						// Note: ctrl+backspace produces ^h on my machine.
-						(KeyCode::Backspace, KeyModifiers::CONTROL) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-							// Not quite right but whatever
-							filter_string.clear();
-							caret_index = 0;
-						}
-
-						(KeyCode::Backspace, _) => if let Some(index) = caret_index.checked_sub(1) {
-							filter_string.remove(index);
-							caret_index -= 1;
-						}
-
-						(KeyCode::Delete, _) => if !filter_string.is_empty() {
-							filter_string.remove(caret_index);
-						}
-
-						(KeyCode::Home, _) => { caret_index = 0; }
-						(KeyCode::End, _) => { caret_index = filter_string.len(); }
-
-						(KeyCode::Left, _) => { caret_index = caret_index.saturating_sub(1); }
-						(KeyCode::Right, _) => { caret_index += 1; }
-
-						(KeyCode::Up, _) => { selected_index = selected_index.saturating_sub(1); }
-						(KeyCode::Down, _) => { selected_index += 1; }
-
-						(KeyCode::PageUp, KeyModifiers::CONTROL) => { selected_index = 0; }
-						(KeyCode::PageDown, KeyModifiers::CONTROL) => { selected_index = filtered_items.len(); }
-
-						(KeyCode::PageUp, _) => { selected_index = selected_index.saturating_sub(terminal_height as usize - 1); }
-						(KeyCode::PageDown, _) => { selected_index += terminal_height as usize - 1; }
-
-						(KeyCode::Char(ch), _) => if ch.is_ascii() {
-							filter_string.insert(caret_index, ch);
-							caret_index += 1;
-						}
-
-						_ => {}
-					}
-
-					break 'events
-				}
-
-				Event::Resize(width, height) => {
-					terminal_height = height;
-					let desired_height = terminal_height.min(items.len() as u16 + 1);
-					max_visible_items = desired_height as usize - 1;
-					break 'events
-				}
-
-				_ => {}
-			}
-		}
-
-		// Refilter
-		filtered_items.clear();
-		filtered_items.extend(
-			item_strings.iter().enumerate()
-				.filter_map(|(index, item)| {
-					matcher.fuzzy_match(item, &filter_string)
-						.map(|score| FilteredItem {
-							score: -score,
-							original_index: index,
-							text: item.as_str(),
-						})
-				})
-		);
-
-		filtered_items.sort();
-
-		// Keep indices in bounds
-		caret_index = caret_index.min(filter_string.len());
-
-		if !filtered_items.is_empty() {
-			selected_index = selected_index.min(filtered_items.len() - 1);
-		}
-
-		// Make sure selection is in view
-		if selected_index >= offset + max_visible_items {
-			offset = selected_index - max_visible_items + 1;
-		} else if selected_index < offset {
-			offset = selected_index;
-		}
-	}
-
-	anyhow::ensure!(selected_index < filtered_items.len());
-
-	Ok(filtered_items[selected_index].original_index)
-}
-
-
-fn start_raw_mode() -> anyhow::Result<impl Drop> {
-	terminal::enable_raw_mode()?;
-	Ok(on_drop(|| {
-		terminal::disable_raw_mode().unwrap()
-	}))
-}
-
-
-fn on_drop(f: impl FnOnce()) -> impl Drop {
+pub fn on_drop(f: impl FnOnce()) -> impl Drop {
 	use std::mem::ManuallyDrop;
 
 	#[must_use]
